@@ -7,6 +7,7 @@ import { randomUUID } from 'node:crypto';
 import type { PlayerAction } from '../betting-round.js';
 import type { Card } from '../cards.js';
 import { startHand, playAction, type GameConfig, type HandPlayer, type TexasHoldemHand } from '../game-flow.js';
+import { MemoryRoomRepository, type RoomRepository } from './repositories.js';
 
 export interface RoomMember {
   readonly playerId: string;
@@ -56,22 +57,24 @@ export class RoomError extends Error {
 export interface RoomServiceOptions {
   readonly roomIdFactory?: () => string;
   readonly deckFactory?: () => readonly Card[];
+  readonly repository?: RoomRepository;
 }
 
 export class RoomService {
-  private readonly rooms = new Map<string, Room>();
   private readonly roomIdFactory: () => string;
   private readonly deckFactory: (() => readonly Card[]) | undefined;
+  private readonly repository: RoomRepository;
+  private readonly pendingOperations = new Map<string, Promise<unknown>>();
 
   public constructor(options: RoomServiceOptions = {}) {
     this.roomIdFactory = options.roomIdFactory ?? (() => randomUUID().slice(0, 8));
     this.deckFactory = options.deckFactory;
+    this.repository = options.repository ?? new MemoryRoomRepository();
   }
 
-  public createRoom(owner: { playerId: string; nickname: string }, input: CreateRoomInput): RoomView {
+  public async createRoom(owner: { playerId: string; nickname: string }, input: CreateRoomInput): Promise<RoomView> {
     validateCreateRoomInput(input);
     const roomId = this.roomIdFactory();
-    if (this.rooms.has(roomId)) throw new RoomError('ROOM_ID_CONFLICT', '房间号冲突，请重试');
     const room: Room = {
       id: roomId,
       name: input.name.trim(),
@@ -82,36 +85,56 @@ export class RoomService {
       members: [{ playerId: owner.playerId, nickname: owner.nickname, seat: 0, stack: input.startingStack, ready: false, connected: true }],
       hand: null,
     };
-    this.rooms.set(roomId, room);
-    return this.getRoomView(roomId, owner.playerId);
+    try {
+      await this.repository.create(room);
+    } catch (error) {
+      if (isUniqueConflict(error)) throw new RoomError('ROOM_ID_CONFLICT', '房间号冲突，请重试');
+      throw error;
+    }
+    return toRoomView(room, owner.playerId);
   }
 
-  public joinRoom(roomId: string, player: { playerId: string; nickname: string }): RoomView {
-    const room = this.requireRoom(roomId);
+  public async joinRoom(roomId: string, player: { playerId: string; nickname: string }): Promise<RoomView> {
+    return this.runExclusive(roomId, () => this.joinRoomUnlocked(roomId, player));
+  }
+
+  private async joinRoomUnlocked(roomId: string, player: { playerId: string; nickname: string }): Promise<RoomView> {
+    const room = await this.requireRoom(roomId);
     const existing = room.members.find(({ playerId }) => playerId === player.playerId);
     if (existing) {
-      this.saveRoom({ ...room, members: room.members.map((member) => member.playerId === player.playerId ? { ...member, connected: true } : member) });
-      return this.getRoomView(roomId, player.playerId);
+      const updated = { ...room, members: room.members.map((member) => member.playerId === player.playerId ? { ...member, connected: true } : member) };
+      await this.saveRoom(updated);
+      return toRoomView(updated, player.playerId);
     }
     if (room.members.length >= room.maxPlayers) throw new RoomError('ROOM_FULL', '房间人数已满');
     if (room.hand && room.hand.street !== 'complete') throw new RoomError('HAND_IN_PROGRESS', '牌局进行中，暂时不能加入');
     const seat = firstFreeSeat(room.members, room.maxPlayers);
-    this.saveRoom({
+    const updated = {
       ...room,
       members: [...room.members, { playerId: player.playerId, nickname: player.nickname, seat, stack: room.startingStack, ready: false, connected: true }],
-    });
-    return this.getRoomView(roomId, player.playerId);
+    };
+    await this.saveRoom(updated);
+    return toRoomView(updated, player.playerId);
   }
 
-  public setReady(roomId: string, playerId: string, ready: boolean): RoomView {
-    const room = this.requireMember(roomId, playerId);
+  public async setReady(roomId: string, playerId: string, ready: boolean): Promise<RoomView> {
+    return this.runExclusive(roomId, () => this.setReadyUnlocked(roomId, playerId, ready));
+  }
+
+  private async setReadyUnlocked(roomId: string, playerId: string, ready: boolean): Promise<RoomView> {
+    const room = await this.requireMember(roomId, playerId);
     if (room.hand && room.hand.street !== 'complete') throw new RoomError('HAND_IN_PROGRESS', '牌局进行中不能修改准备状态');
-    this.saveRoom({ ...room, members: room.members.map((member) => member.playerId === playerId ? { ...member, ready } : member) });
-    return this.getRoomView(roomId, playerId);
+    const updated = { ...room, members: room.members.map((member) => member.playerId === playerId ? { ...member, ready } : member) };
+    await this.saveRoom(updated);
+    return toRoomView(updated, playerId);
   }
 
-  public startGame(roomId: string, ownerId: string): RoomView {
-    const room = this.requireMember(roomId, ownerId);
+  public async startGame(roomId: string, ownerId: string): Promise<RoomView> {
+    return this.runExclusive(roomId, () => this.startGameUnlocked(roomId, ownerId));
+  }
+
+  private async startGameUnlocked(roomId: string, ownerId: string): Promise<RoomView> {
+    const room = await this.requireMember(roomId, ownerId);
     if (room.ownerId !== ownerId) throw new RoomError('NOT_OWNER', '只有房主可以开始牌局');
     if (room.hand && room.hand.street !== 'complete') throw new RoomError('HAND_IN_PROGRESS', '牌局已经开始');
     const participants = room.members.filter(({ ready, connected, stack }) => ready && connected && stack > 0);
@@ -124,12 +147,17 @@ export class RoomService {
       room.config,
       { previousDealerSeat, handNumber, ...(deck ? { deck } : {}) },
     );
-    this.saveRoom({ ...room, hand });
-    return this.getRoomView(roomId, ownerId);
+    const updated = { ...room, hand };
+    await this.saveRoom(updated);
+    return toRoomView(updated, ownerId);
   }
 
-  public act(roomId: string, playerId: string, action: PlayerAction): RoomView {
-    const room = this.requireMember(roomId, playerId);
+  public async act(roomId: string, playerId: string, action: PlayerAction): Promise<RoomView> {
+    return this.runExclusive(roomId, () => this.actUnlocked(roomId, playerId, action));
+  }
+
+  private async actUnlocked(roomId: string, playerId: string, action: PlayerAction): Promise<RoomView> {
+    const room = await this.requireMember(roomId, playerId);
     if (!room.hand || room.hand.street === 'complete') throw new RoomError('NO_ACTIVE_HAND', '当前没有进行中的牌局');
     if (!room.hand.players.some(({ id }) => id === playerId)) throw new RoomError('NOT_IN_HAND', '当前玩家未参与本手牌');
     const hand = playAction(room.hand, playerId, action);
@@ -139,49 +167,75 @@ export class RoomService {
           return { ...member, stack: handPlayer?.stack ?? member.stack, ready: false };
         })
       : room.members;
-    this.saveRoom({ ...room, hand, members });
-    return this.getRoomView(roomId, playerId);
+    const updated = { ...room, hand, members };
+    await this.saveRoom(updated);
+    return toRoomView(updated, playerId);
   }
 
-  public setConnected(playerId: string, connected: boolean): string[] {
+  public async setConnected(playerId: string, connected: boolean): Promise<string[]> {
     const changedRoomIds: string[] = [];
-    for (const room of this.rooms.values()) {
+    for (const room of await this.repository.findAll()) {
       if (!room.members.some((member) => member.playerId === playerId)) continue;
-      this.saveRoom({ ...room, members: room.members.map((member) => member.playerId === playerId ? { ...member, connected } : member) });
+      await this.runExclusive(room.id, async () => {
+        const current = await this.requireRoom(room.id);
+        await this.saveRoom({
+          ...current,
+          members: current.members.map((member) => member.playerId === playerId ? { ...member, connected } : member),
+        });
+      });
       changedRoomIds.push(room.id);
     }
     return changedRoomIds;
   }
 
-  public getRoomView(roomId: string, viewerId: string): RoomView {
-    const room = this.requireMember(roomId, viewerId);
-    return {
-      ...room,
-      members: room.members.map((member) => ({ ...member })),
-      config: { ...room.config },
-      hand: room.hand ? sanitizeHand(room.hand, viewerId) : null,
-    };
+  public async getRoomView(roomId: string, viewerId: string): Promise<RoomView> {
+    return toRoomView(await this.requireMember(roomId, viewerId), viewerId);
   }
 
-  public roomIdsForPlayer(playerId: string): string[] {
-    return [...this.rooms.values()].filter((room) => room.members.some((member) => member.playerId === playerId)).map(({ id }) => id);
+  public async roomIdsForPlayer(playerId: string): Promise<string[]> {
+    return (await this.repository.findAll()).filter((room) => room.members.some((member) => member.playerId === playerId)).map(({ id }) => id);
   }
 
-  private requireRoom(roomId: string): Room {
-    const room = this.rooms.get(roomId);
+  private async requireRoom(roomId: string): Promise<Room> {
+    const room = await this.repository.findById(roomId);
     if (!room) throw new RoomError('ROOM_NOT_FOUND', '房间不存在');
     return room;
   }
 
-  private requireMember(roomId: string, playerId: string): Room {
-    const room = this.requireRoom(roomId);
+  private async requireMember(roomId: string, playerId: string): Promise<Room> {
+    const room = await this.requireRoom(roomId);
     if (!room.members.some((member) => member.playerId === playerId)) throw new RoomError('NOT_ROOM_MEMBER', '玩家不在该房间');
     return room;
   }
 
-  private saveRoom(room: Room): void {
-    this.rooms.set(room.id, room);
+  private async saveRoom(room: Room): Promise<void> {
+    await this.repository.save(room);
   }
+
+  private async runExclusive<T>(roomId: string, operation: () => Promise<T>): Promise<T> {
+    const previous = this.pendingOperations.get(roomId) ?? Promise.resolve();
+    const current = previous.catch(() => undefined).then(operation);
+    this.pendingOperations.set(roomId, current);
+    try {
+      return await current;
+    } finally {
+      if (this.pendingOperations.get(roomId) === current) this.pendingOperations.delete(roomId);
+    }
+  }
+}
+
+function toRoomView(room: Room, viewerId: string): RoomView {
+  return {
+    ...room,
+    members: room.members.map((member) => ({ ...member })),
+    config: { ...room.config },
+    hand: room.hand ? sanitizeHand(room.hand, viewerId) : null,
+  };
+}
+
+function isUniqueConflict(error: unknown): boolean {
+  if (error instanceof Error && error.message === 'ROOM_ID_CONFLICT') return true;
+  return typeof error === 'object' && error !== null && 'code' in error && error.code === 'P2002';
 }
 
 function sanitizeHand(hand: TexasHoldemHand, viewerId: string): RoomHandView {

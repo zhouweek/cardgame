@@ -66,42 +66,46 @@ export function buildServer(options: { readonly sessions?: SessionService; reado
     const parsed = sessionSchema.safeParse(request.body);
     if (!parsed.success) return reply.code(400).send(toFailure(new RoomError('INVALID_PAYLOAD', '昵称参数无效')));
     try {
-      return reply.code(201).send({ ok: true, data: sessions.create(parsed.data.nickname) });
+      return reply.code(201).send({ ok: true, data: await sessions.create(parsed.data.nickname) });
     } catch (error) {
       return reply.code(400).send(toFailure(error));
     }
   });
 
-  io.use((socket, next) => {
-    const auth = socket.handshake.auth as Record<string, unknown>;
-    const playerId = typeof auth.playerId === 'string' ? auth.playerId : '';
-    const token = typeof auth.token === 'string' ? auth.token : '';
-    const session = sessions.verify(playerId, token);
-    if (!session) return next(new Error('UNAUTHORIZED'));
-    socket.data.playerId = session.playerId;
-    socket.data.nickname = session.nickname;
-    next();
+  io.use(async (socket, next) => {
+    try {
+      const auth = socket.handshake.auth as Record<string, unknown>;
+      const playerId = typeof auth.playerId === 'string' ? auth.playerId : '';
+      const token = typeof auth.token === 'string' ? auth.token : '';
+      const session = await sessions.verify(playerId, token);
+      if (!session) return next(new Error('UNAUTHORIZED'));
+      socket.data.playerId = session.playerId;
+      socket.data.nickname = session.nickname;
+      next();
+    } catch (error) {
+      next(error instanceof Error ? error : new Error('INTERNAL_ERROR'));
+    }
   });
 
   const broadcastRoom = async (roomId: string): Promise<void> => {
     const sockets = await io.in(channel(roomId)).fetchSockets();
     for (const socket of sockets) {
-      try { socket.emit('room:state', rooms.getRoomView(roomId, socket.data.playerId)); }
+      try { socket.emit('room:state', await rooms.getRoomView(roomId, socket.data.playerId)); }
       catch (error) { socket.emit('room:error', toFailure(error).error); }
     }
   };
 
   io.on('connection', async (socket) => {
-    rooms.setConnected(socket.data.playerId, true);
-    for (const roomId of rooms.roomIdsForPlayer(socket.data.playerId)) {
+    await rooms.setConnected(socket.data.playerId, true);
+    for (const roomId of await rooms.roomIdsForPlayer(socket.data.playerId)) {
       await socket.join(channel(roomId));
-      socket.emit('room:state', rooms.getRoomView(roomId, socket.data.playerId));
+      socket.emit('room:state', await rooms.getRoomView(roomId, socket.data.playerId));
     }
 
     socket.on('room:create', async (payload, ack) => {
       await handle(ack, async () => {
         const input = parse(createRoomSchema, payload);
-        const room = rooms.createRoom({ playerId: socket.data.playerId, nickname: socket.data.nickname }, input);
+        const room = await rooms.createRoom({ playerId: socket.data.playerId, nickname: socket.data.nickname }, input);
         await socket.join(channel(room.id));
         await broadcastRoom(room.id);
         return room;
@@ -111,7 +115,7 @@ export function buildServer(options: { readonly sessions?: SessionService; reado
     socket.on('room:join', async (payload, ack) => {
       await handle(ack, async () => {
         const { roomId } = parse(roomIdSchema, payload);
-        const room = rooms.joinRoom(roomId, { playerId: socket.data.playerId, nickname: socket.data.nickname });
+        const room = await rooms.joinRoom(roomId, { playerId: socket.data.playerId, nickname: socket.data.nickname });
         await socket.join(channel(roomId));
         await broadcastRoom(roomId);
         return room;
@@ -121,7 +125,7 @@ export function buildServer(options: { readonly sessions?: SessionService; reado
     socket.on('room:ready', async (payload, ack) => {
       await handle(ack, async () => {
         const { roomId, ready } = parse(readySchema, payload);
-        const room = rooms.setReady(roomId, socket.data.playerId, ready);
+        const room = await rooms.setReady(roomId, socket.data.playerId, ready);
         await broadcastRoom(roomId);
         return room;
       });
@@ -130,14 +134,14 @@ export function buildServer(options: { readonly sessions?: SessionService; reado
     socket.on('room:sync', async (payload, ack) => {
       await handle(ack, async () => {
         const { roomId } = parse(roomIdSchema, payload);
-        return rooms.getRoomView(roomId, socket.data.playerId);
+        return await rooms.getRoomView(roomId, socket.data.playerId);
       });
     });
 
     socket.on('game:start', async (payload, ack) => {
       await handle(ack, async () => {
         const { roomId } = parse(roomIdSchema, payload);
-        const room = rooms.startGame(roomId, socket.data.playerId);
+        const room = await rooms.startGame(roomId, socket.data.playerId);
         await broadcastRoom(roomId);
         return room;
       });
@@ -146,14 +150,14 @@ export function buildServer(options: { readonly sessions?: SessionService; reado
     socket.on('game:action', async (payload, ack) => {
       await handle(ack, async () => {
         const { roomId, action } = parse(actionSchema, payload);
-        const room = rooms.act(roomId, socket.data.playerId, action as PlayerAction);
+        const room = await rooms.act(roomId, socket.data.playerId, action as PlayerAction);
         await broadcastRoom(roomId);
         return room;
       });
     });
 
-    socket.on('disconnect', () => {
-      for (const roomId of rooms.setConnected(socket.data.playerId, false)) void broadcastRoom(roomId);
+    socket.on('disconnect', async () => {
+      for (const roomId of await rooms.setConnected(socket.data.playerId, false)) await broadcastRoom(roomId);
     });
   });
 

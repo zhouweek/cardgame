@@ -1,0 +1,27 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model PlayerSession {
+  playerId  String   @id @default(uuid()) @map("player_id") @db.Uuid
+  token     String   @unique @default(uuid()) @db.Uuid
+  nickname  String   @db.VarChar(20)
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@map("player_sessions")
+}
+
+model RoomState {
+  id        String   @id @db.VarChar(32)
+  state     Json
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@map("room_states")
+}
